@@ -1,0 +1,143 @@
+{
+  "api": {
+    "description": "生图 API（OpenAI 兼容 /v1/images 接口，Magpie 网关：codex/gpt-image-2）",
+    "type": "object",
+    "items": {
+      "base_url": {
+        "description": "API 根地址，如 http://127.0.0.1:3425 或 https://api.openai.com",
+        "type": "string",
+        "default": "http://127.0.0.1:3425",
+        "hint": "AstrBot 在 Docker 内时不要用 127.0.0.1，改用宿主地址或 host.docker.internal。"
+      },
+      "api_key": {
+        "description": "API Key（Bearer）",
+        "type": "string",
+        "default": "",
+        "obvious_hint": true
+      },
+      "image_model": {
+        "description": "生图模型 ID",
+        "type": "string",
+        "default": "gpt-image-2"
+      },
+      "fallback_models": {
+        "description": "备用生图模型（主模型失败时按顺序尝试）",
+        "type": "list",
+        "default": []
+      },
+      "timeout_seconds": {
+        "description": "单次生图请求超时（秒）",
+        "type": "int",
+        "slider": { "min": 30, "max": 900, "step": 30 },
+        "default": 300
+      },
+      "extra_body": {
+        "description": "透传给生图接口的额外参数",
+        "type": "dict",
+        "default": {},
+        "hint": "如 output_format、background 等；不能覆盖 model/prompt/n/image。"
+      }
+    }
+  },
+  "generation": {
+    "description": "默认生成参数",
+    "type": "object",
+    "items": {
+      "size": {
+        "description": "默认尺寸",
+        "type": "string",
+        "options": ["", "auto", "1024x1024", "1536x1024", "1024x1536"],
+        "default": "1024x1024",
+        "hint": "gpt-image-2 主要以提示词控制画幅，实际像素以返回结果为准，插件会如实显示。"
+      },
+      "quality": {
+        "description": "默认质量",
+        "type": "string",
+        "options": ["low", "medium", "high", "auto"],
+        "default": "medium"
+      },
+      "reference_mode": {
+        "description": "引用图来源模式",
+        "type": "string",
+        "options": ["auto", "quote", "message", "history"],
+        "default": "auto",
+        "hint": "auto=优先引用消息，否则取本条消息内的图，不扫描无关历史；引用读取失败会明确报错而非转文生图。quote=只取引用消息；message=只取本条图；history=显式扫描群历史图。"
+      }
+    }
+  },
+  "diagnosis": {
+    "description": "多模态修图诊断（只输出文字，不调用生图接口）",
+    "type": "object",
+    "items": {
+      "provider_id": {
+        "description": "诊断多模态模型",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "留空优先复用当前会话配置的图片描述模型，否则使用当前对话模型；必须支持图片输入。不改变默认聊天模型。"
+      },
+      "timeout_seconds": {
+        "description": "诊断超时（秒，不自动重试）",
+        "type": "int",
+        "default": 120,
+        "slider": { "min": 30, "max": 300, "step": 10 }
+      },
+      "max_output_chars": {
+        "description": "诊断总文字长度上限（自动分段发送）",
+        "type": "int",
+        "default": 6000,
+        "slider": { "min": 1000, "max": 10000, "step": 500 }
+      },
+      "max_daily_per_user": {
+        "description": "每人每天最多诊断调用次数（与生图额度独立，0=不限制）",
+        "type": "int",
+        "default": 30
+      }
+    }
+  },
+  "access": {
+    "description": "权限与可见性",
+    "type": "object",
+    "items": {
+      "generate_admin_only": {
+        "description": "生图指令仅管理员可用",
+        "type": "bool",
+        "default": true
+      },
+      "admin_user_ids": {
+        "description": "额外放行的用户 ID（逗号分隔，留空则仅 AstrBot 管理员）",
+        "type": "string",
+        "default": ""
+      },
+      "show_prompt_in_reply": {
+        "description": "回图时附带本次提示词",
+        "type": "bool",
+        "default": false
+      }
+    }
+  },
+  "limits": {
+    "description": "限额与防滥用",
+    "type": "object",
+    "items": {
+      "cooldown_seconds": {
+        "description": "同一用户两次生图的最小间隔（秒）",
+        "type": "int",
+        "slider": { "min": 0, "max": 600, "step": 1 },
+        "default": 8
+      },
+      "max_daily_per_user": {
+        "description": "同一用户每天最多生图次数（0=不限制）",
+        "type": "int",
+        "slider": { "min": 0, "max": 1000, "step": 1 },
+        "default": 60
+      },
+      "max_concurrency": {
+        "description": "全局并发生图任务上限",
+        "type": "int",
+        "slider": { "min": 1, "max": 8, "step": 1 },
+        "default": 2
+      }
+    }
+  }
+}

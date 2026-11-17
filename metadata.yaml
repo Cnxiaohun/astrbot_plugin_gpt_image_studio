@@ -1,0 +1,10 @@
+name: astrbot_plugin_gpt_image_studio
+display_name: GPT 生图大师
+desc: 管理员在群内调用 codex/gpt-image-2 生图与改图：引用群聊图片作为参考（支持一条消息内多张、引用消息内多张一起识别），发送提示词即可图生图、局部改图、换画风、多图融合；也可纯文生图。新增多模态修图诊断：看图输出文字版 Photoshop / Camera Raw 参数建议，不生图不改图。长任务在独立后台执行并回原会话，不受工具 30 秒超时影响，也不会把其他群的结果发错。可指定画幅与画质，内置管理员权限、冷却、生图/诊断独立额度与失败不静默计费重试。
+short_desc: 引用多张群图生图/改图，或让多模态模型给出PS修图参数；管理员可用，后台任务不丢图。
+version: v1.3.1
+author: cnxiaohun
+repo: https://github.com/Cnxiaohun/astrbot_plugin_gpt_image_studio
+astrbot_version: ">=4.29.1"
+support_platforms:
+  - aiocqhttp
