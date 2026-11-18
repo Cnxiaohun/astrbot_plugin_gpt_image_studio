@@ -48,7 +48,7 @@ class DiagnosisCommandTests(unittest.IsolatedAsyncioTestCase):
         with patch('astrbot_plugin_gpt_image_studio.main.gather_references',new=AsyncMock(return_value=[b'one',b'two',b'three'])),patch('astrbot_plugin_gpt_image_studio.main.prepare_reference',new=AsyncMock(side_effect=lambda x:x)),patch('astrbot_plugin_gpt_image_studio.main.diagnose',side_effect=model) as diag:
             text=await p._diagnose(ev,'自然保真',(3,1))
         self.assertIn('曝光+0.3 EV',text)
-        self.assertIn('3,1',text)
+        self.assertIn('图1＝原图3，图2＝原图1',text)
         self.assertEqual(p.quota.used_today('test-user'),1)
         self.assertEqual(p.diagnosis_quota.used_today('test-user'),1)
         self.assertFalse(p._busy_users)

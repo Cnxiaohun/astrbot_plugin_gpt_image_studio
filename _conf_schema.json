@@ -83,10 +83,10 @@
         "slider": { "min": 30, "max": 300, "step": 10 }
       },
       "max_output_chars": {
-        "description": "诊断总文字长度上限（自动分段发送）",
+        "description": "诊断总字数上限（会另按图片数量收紧，单图至多240字）",
         "type": "int",
-        "default": 6000,
-        "slider": { "min": 1000, "max": 10000, "step": 500 }
+        "default": 600,
+        "slider": { "min": 200, "max": 4000, "step": 100 }
       },
       "max_daily_per_user": {
         "description": "每人每天最多诊断调用次数（与生图额度独立，0=不限制）",

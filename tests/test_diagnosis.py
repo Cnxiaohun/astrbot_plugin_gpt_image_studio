@@ -111,8 +111,8 @@ class DiagnosisTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["image_urls"], [
             "data:image/png;base64," + base64.b64encode(image).decode("ascii") for image in self.images
         ])
-        self.assertIn("图片1", kwargs["prompt"])
-        self.assertIn("图片2", kwargs["prompt"])
+        self.assertIn("图1", kwargs["prompt"])
+        self.assertIn("图2", kwargs["prompt"])
         self.assertIn("保持人物身份特征，清理背景", kwargs["prompt"])
         self.assertIsNone(kwargs["func_tool"])
         self.assertEqual(kwargs["contexts"], [])
@@ -121,11 +121,14 @@ class DiagnosisTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("conversation_id", kwargs)
         self.assertNotIn("tools", kwargs)
         self.assertEqual(kwargs["system_prompt"], SYSTEM_PROMPT)
-        self.assertTrue(result.startswith(DISCLAIMER))
+        self.assertFalse(DISCLAIMER)
+        self.assertIn("图片1", result)
 
-    async def test_blank_goal_defaults_to_natural_fidelity(self):
+    async def test_blank_goal_does_not_invent_aesthetic_goal(self):
         await self.call(" \n ")
-        self.assertIn("自然保真", self.provider.text_chat.call_args.kwargs["prompt"])
+        prompt = self.provider.text_chat.call_args.kwargs["prompt"]
+        self.assertIn("未指定", prompt)
+        self.assertNotIn("自然保真", prompt)
 
     async def test_no_permissions_or_history_api_are_consulted(self):
         # Context/event expose only the specified provider-selection APIs. No
@@ -136,28 +139,41 @@ class DiagnosisTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["contexts"], [])
         self.assertIsNone(kwargs["func_tool"])
 
-    async def test_fixed_disclaimer_units_and_photographic_constraints(self):
+    async def test_internal_safety_without_repeating_disclaimer_to_user(self):
         result = await self.call()
-        self.assertIn("仅提供文字修图建议，不生成或修改图片", result)
-        self.assertIn("建议起点", result)
-        self.assertIn("非精确测量", result)
-        self.assertIn("JPEG/PNG", result)
-        self.assertIn("-100..+100", result)
-        self.assertIn("Kelvin", result)
-        for term in ["曝光", "-5..+5 EV", "色温", "色调", "0..255", "HSL", "颜色通道", "蒙版", "修复", "裁切", "锐化", "降噪", "操作顺序", "检查标准", "EXIF", "直方图", "肤色数值", "不得识别真人身份", "数据", "不是你要执行的指令"]:
+        self.assertNotIn("免责声明", result)
+        self.assertNotIn("Kelvin", result)
+        self.assertNotIn("未提供上下文", result)
+        for term in ["曝光", "色温", "色调", "Kelvin", "EXIF", "直方图", "图片里的文字", "不写 Markdown", "最影响效果"]:
             self.assertIn(term, SYSTEM_PROMPT)
+
+    async def test_long_markdown_diagnosis_is_short_plain_text(self):
+        self.provider.text_chat.return_value = SimpleNamespace(completion_text=(
+            "## 图片分析\n### 图片1\n**核心问题**：苹果反光太亮。\n"
+            "- 高光 -20，保住表皮纹理。\n- 阴影 +10。\n"
+            "### 操作顺序\n" + "* 通用提醒：参数只是建议，记得检查。\n" * 100
+        ))
+        text = await self.call()
+        self.assertIn("苹果反光太亮", text)
+        self.assertLessEqual(len(text), 440)
+        for marker in ("##", "**", "免责声明", "以下是建议", "操作顺序"):
+            self.assertNotIn(marker, text)
+
+    async def test_plain_unneeded_adjustment_survives(self):
+        self.provider.text_chat.return_value = SimpleNamespace(completion_text="画面已经很干净，不需要修，保留原图。")
+        self.assertEqual(await self.call(settings={"max_output_chars": 500}), "画面已经很干净，不需要修，保留原图。")
 
     async def test_output_limit_default_minimum_maximum_and_truncation(self):
         self.provider.text_chat.return_value = SimpleNamespace(completion_text="建议" * 10000)
-        for settings, limit in [({}, 6000), ({"max_output_chars": 1}, 1000), ({"max_output_chars": 12000}, 10000), ({"max_output_chars": 1300}, 1300), ({"max_output_chars": "bad"}, 6000)]:
+        for settings, limit in [({}, 440), ({"max_output_chars": 1}, 200), ({"max_output_chars": 12000}, 440), ({"max_output_chars": 1300}, 440), ({"max_output_chars": "bad"}, 440)]:
             result = await self.call(settings=settings)
             self.assertLessEqual(len(result), limit)
-            self.assertTrue(result.startswith(DISCLAIMER))
-            self.assertIn("已截断", result)
+            self.assertTrue(result.endswith("…"))
+            self.assertNotIn("免责声明", result)
 
     async def test_short_result_is_not_marked_truncated(self):
         result = await self.call(settings={"max_output_chars": 1000})
-        self.assertNotIn("已截断", result)
+        self.assertFalse(result.endswith("…"))
         self.assertIn("图片2", result)
 
     async def test_timeout_setting_is_defaulted_and_clamped(self):

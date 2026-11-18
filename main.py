@@ -392,7 +392,8 @@ class GptImageStudio(Star):
                 info["status"] = "发送中"
                 logger.info("GPT 生图大师任务回发：job=%s target=%s has_image=%s", job_id, destination, path is not None)
                 if path is None:
-                    for part in self._text_parts(f"任务 {job_id} · {kind}\n{note}"):
+                    body = note if kind == "诊断" else f"任务 {job_id} · {kind}\n{note}"
+                    for part in self._text_parts(body):
                         await self._deliver_text(event, part)
                 else:
                     await self._deliver_chain(event, build_reply(path, f"任务 {job_id}\n{note}"))
@@ -678,8 +679,10 @@ class GptImageStudio(Star):
                     logger.warning("GPT 生图大师诊断异常：%s", type(exc).__name__)
                     return "修图诊断失败，请检查所选模型是否支持图片输入；未调用生图接口。"
             logger.info("GPT 生图大师诊断完成：references=%d", len(images))
-            numbers = ",".join(str(i) for i in selection)
-            return f"修图诊断 · 原参考图编号 {numbers}（报告内按此顺序编号）\n{result}"
+            if len(selection) > 1 and selection != tuple(range(1, len(selection) + 1)):
+                mapping = "，".join(f"图{i}＝原图{source}" for i, source in enumerate(selection, 1))
+                return f"{mapping}\n{result}"
+            return result
         finally:
             self._busy_users.discard(busy_key)
             self._active_tasks.discard(task)
