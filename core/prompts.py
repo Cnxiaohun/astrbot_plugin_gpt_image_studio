@@ -37,6 +37,7 @@ _ACTION_ALIASES = {
     "重试": "retry", "retry": "retry", "redo": "retry",
     "诊断": "diagnose", "修图建议": "diagnose", "diagnose": "diagnose", "advice": "diagnose",
     "状态": "status", "status": "status",
+    "补发": "resend", "resend": "resend",
     "帮助": "help", "help": "help", "?": "help", "？": "help",
 }
 _OPTION_NAMES = {
@@ -181,9 +182,13 @@ def parse_studio_command(text: str) -> CommandRequest:
         return CommandRequest(action="help", prompt="")
     action = _ACTION_ALIASES.get(head.group().lower())
     if action is None:
-        raise ValueError(f"未知操作：{head.group()}；可用：创建/编辑/风格/融合/诊断/重试/状态/帮助")
+        raise ValueError(f"未知操作：{head.group()}；可用：创建/编辑/风格/融合/诊断/重试/状态/补发/帮助")
     parsed, options = _parse_options(text[head.end():])
-    if action in {"help", "status", "retry"}:
+    if action in {"status", "resend"}:
+        if options or (parsed.prompt and not re.fullmatch(r"[0-9a-fA-F]{10}", parsed.prompt)) or (action == "resend" and not parsed.prompt):
+            raise ValueError("请提供 10 位任务号，例如 /生图 状态 01ab23cd45 或 /生图 补发 01ab23cd45")
+        parsed.prompt = parsed.prompt.lower()
+    elif action in {"help", "retry"}:
         if parsed.prompt or options:
             raise ValueError("帮助/状态/重试不接受提示词或生成参数")
     elif action == "diagnose":

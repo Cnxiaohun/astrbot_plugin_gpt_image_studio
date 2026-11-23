@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import sys
 import time
@@ -31,11 +32,12 @@ from . import __version__
 from .core import config as cfgmod
 from .core.image_client import ImageClient
 from .core.diagnosis import diagnose
-from .core.http_utils import ClientError
+from .core.http_utils import AmbiguousRequestError, ClientError
 from .core.images import ImageError, prepare_reference
 from .core.prompts import ParsedArgs, parse_generate_args, prompt_guard, split_reference_mode, parse_studio_command
 from .core.quota import Quota
 from .core.references import MAX_REFERENCES, gather_references
+from .core.receipts import JOB_ID, Receipts, UNKNOWN_DELIVERY, recover_output
 from .core.store import Store, build_reply  # build_reply used by _reply_image
 
 PLUGIN_NAME = "astrbot_plugin_gpt_image_studio"
@@ -48,7 +50,8 @@ HELP = """GPT 生图大师 · /生图 <操作> [参数] <提示词>
 /生图 融合 将第1张人物与第2张场景融合成海报
 /生图 诊断 [修图目标]  看图给PS/Camera Raw参数建议，只输出文字
 /生图 重试     复用上次成功任务，会再次计费
-/生图 状态     查看额度与进行中任务
+/生图 状态 [任务号]  查看额度或单个任务
+/生图 补发 <任务号>  原会话取回已保存的图，不重新生成
 /生图 帮助     本说明（直接 /生图 也可）
 
 参数（提示词前后均可）：
@@ -95,6 +98,8 @@ class GptImageStudio(Star):
         self.config = config
         self.client: ImageClient | None = None
         self.store: Store | None = None
+        self.receipts: Receipts | None = None
+        self._resending: set[str] = set()
         self.quota = Quota()
         self.diagnosis_quota = Quota(cooldown_seconds=8, max_daily=30)
         self._sem: asyncio.Semaphore | None = None
@@ -113,6 +118,7 @@ class GptImageStudio(Star):
         self.client = ImageClient(api)
         data_dir = Path(StarTools.get_data_dir(PLUGIN_NAME))
         self.store = Store(data_dir)
+        self.receipts = Receipts(data_dir / "job_receipts.json")
         lim = cfgmod.limits(self.config)
         self.quota = Quota(cooldown_seconds=lim["cooldown_seconds"], max_daily=lim["max_daily"])
         self.quota.load(data_dir / "quota.json")
@@ -165,6 +171,25 @@ class GptImageStudio(Star):
         platform = getattr(event, "get_platform_id", lambda: "")()
         return f"{platform}:{event.get_session_id()}:{self._uid(event)}"
 
+    def _receipt_scope(self, event) -> str:
+        origin = getattr(event, "unified_msg_origin", "") or self._job_key(event)
+        sender = event.get_sender_id()
+        return json.dumps([origin, str(sender)], ensure_ascii=False) if sender else ""
+
+    def _checkpoint(self, event, status, *, final=False, strict=False):
+        job = event.get_extra("gpt_image_job_id") if self.receipts is not None else None
+        if not job or job not in self._job_info:
+            return
+        info = self._job_info[job]
+        info["receipt_status"] = status
+        try:
+            self.receipts.put(job, info["scope"], status, output=Path(info["path"]).name, final=final)
+        except OSError:
+            logger.warning("GPT 生图大师任务记录写入失败：job=%s", job)
+            if strict:
+                self.receipts.rows.pop(job, None)
+                raise ClientError("无法保存任务记录，未提交请求。") from None
+
     @staticmethod
     def _is_webchat(event) -> bool:
         try:
@@ -181,14 +206,16 @@ class GptImageStudio(Star):
         umo = getattr(event, "unified_msg_origin", "") or ""
         if self._is_webchat(event) and self.context is not None and umo:
             from astrbot.api.event import MessageChain
-            await self.context.send_message(umo, MessageChain().message(text))
+            if await self.context.send_message(umo, MessageChain().message(text)) is False:
+                raise ClientError("找不到原会话的发送适配器。")
             return
         await event.send(event.plain_result(text))
 
     async def _deliver_chain(self, event, chain) -> None:
         umo = getattr(event, "unified_msg_origin", "") or ""
         if self._is_webchat(event) and self.context is not None and umo:
-            await self.context.send_message(umo, chain)
+            if await self.context.send_message(umo, chain) is False:
+                raise ClientError("找不到原会话的发送适配器。")
             return
         await event.send(chain)
 
@@ -316,11 +343,13 @@ class GptImageStudio(Star):
         if not parsed.prompt:
             return None, "提示词不能为空，例如：/生图 一只橘猫"
 
+        self._checkpoint(event, "排队中")
         logger.info("GPT 生图大师任务开始：mode=%s references=%d", mode, len(refs))
         async with self._sem:
             gate = self.quota.check(user)
             if gate:
                 return None, gate
+            self._checkpoint(event, "生成中")
             try:
                 if refs:
                     result = await self.client.edit(
@@ -331,6 +360,9 @@ class GptImageStudio(Star):
                     result = await self.client.generate(
                         parsed.prompt, size=size, quality=quality,
                     )
+            except AmbiguousRequestError as exc:
+                self._checkpoint(event, "出图或计费结果不明；未自动重试", final=True)
+                return None, f"出图结果不明：{exc}"
             except (ImageError, ClientError) as exc:
                 return None, f"出图失败：{exc}"
             except Exception as exc:  # noqa: BLE001
@@ -342,6 +374,9 @@ class GptImageStudio(Star):
             path = self.store.save(result.data, result.mime)
         except ClientError as exc:
             return None, f"生图已完成但保存失败：{exc}；请勿自动重试（可能再次计费）。"
+        if job_id and job_id in self._job_info:
+            self._job_info[job_id]["path"] = str(path)
+            self._checkpoint(event, "已出图，等待发送")
         logger.info("GPT 生图大师任务完成：references=%d pixels=%dx%d", len(refs), result.width, result.height)
         async with self._lock:
             self._remember_job(event, JobSnapshot(parsed.prompt, size, quality, tuple(refs), time.monotonic()))
@@ -370,10 +405,19 @@ class GptImageStudio(Star):
             raise ClientError("你在本会话已有一个任务进行中，请等它完成，不要重复提交。")
         if len(self._jobs) >= 16:
             raise ClientError("任务队列已满，请稍后再试。")
-        self._pending_scopes.add(destination)
+        scope = self._receipt_scope(event)
+        if not scope:
+            raise ClientError("无法确认发起者，未提交请求。")
         job_id = uuid.uuid4().hex[:10]
-        info = {"destination": destination, "kind": kind, "status": "已受理", "path": ""}
+        info = {"destination": destination, "scope": scope, "kind": kind, "status": "已受理", "path": ""}
         self._job_info[job_id] = info
+        event.set_extra("gpt_image_job_id", job_id)
+        try:
+            self._checkpoint(event, "已受理", strict=True)
+        except ClientError:
+            self._job_info.pop(job_id, None)
+            raise
+        self._pending_scopes.add(destination)
         while len(self._job_info) > 100:
             removable = next((i for i in self._job_info if i not in self._jobs and i != job_id), None)
             if removable is None:
@@ -383,6 +427,7 @@ class GptImageStudio(Star):
         async def worker():
             try:
                 info["status"] = "处理中"
+                self._checkpoint(event, "读图或准备中" if kind == "生图" else "诊断处理中")
                 if kind == "诊断":
                     path, note = None, await operation()
                 else:
@@ -390,6 +435,11 @@ class GptImageStudio(Star):
                 if path is not None:
                     info["path"] = str(path)
                 info["status"] = "发送中"
+                if kind == "生图":
+                    if path is not None:
+                        self._checkpoint(event, "已出图，发送中")
+                    elif "结果不明" not in info.get("receipt_status", ""):
+                        self._checkpoint(event, "未出图（失败或请求未提交）", final=True)
                 logger.info("GPT 生图大师任务回发：job=%s target=%s has_image=%s", job_id, destination, path is not None)
                 if path is None:
                     body = note if kind == "诊断" else f"任务 {job_id} · {kind}\n{note}"
@@ -398,13 +448,22 @@ class GptImageStudio(Star):
                 else:
                     await self._deliver_chain(event, build_reply(path, f"任务 {job_id}\n{note}"))
                 info["status"] = "平台发送已返回"
+                if path is not None:
+                    self._checkpoint(event, "已出图；平台发送接口已返回，不代表已收到", final=True)
+                elif kind == "诊断":
+                    self._checkpoint(event, "诊断任务结束；文字回复已交给平台", final=True)
                 logger.info("GPT 生图大师任务发送返回：job=%s target=%s", job_id, destination)
             except asyncio.CancelledError:
                 info["status"] = "任务被取消，结果可能已计费"
+                self._checkpoint(event, UNKNOWN_DELIVERY if info["path"] else "任务被中断；出图或计费结果可能不明", final=True)
                 logger.warning("GPT 生图大师任务取消：job=%s target=%s；不自动重试", job_id, destination)
                 raise
             except Exception as exc:
                 info["status"] = "发送结果不明" if info["status"] == "发送中" else "处理失败"
+                if info["path"]:
+                    self._checkpoint(event, UNKNOWN_DELIVERY, final=True)
+                elif kind != "生图" or "结果不明" not in info.get("receipt_status", ""):
+                    self._checkpoint(event, "处理失败；未保存成品", final=True)
                 logger.error("GPT 生图大师后台任务异常：job=%s target=%s status=%s error=%s saved=%s", job_id, destination, info["status"], type(exc).__name__, info["path"])
                 # Do not automatically resend an image after an ambiguous dispatch.
                 if info["status"] != "发送结果不明":
@@ -423,7 +482,6 @@ class GptImageStudio(Star):
             if not done.cancelled() and done.exception() is not None:
                 logger.error("GPT 生图大师后台任务异常：job=%s type=%s", job_id, type(done.exception()).__name__)
         task.add_done_callback(finished)
-        event.set_extra("gpt_image_job_id", job_id)
         logger.info("GPT 生图大师任务受理：job=%s target=%s kind=%s", job_id, destination, kind)
         return job_id
 
@@ -438,12 +496,18 @@ class GptImageStudio(Star):
         try:
             request = parse_studio_command(raw)
         except ValueError as exc:
-            yield event.plain_result(f"参数错误：{exc}\n用法：/生图 <创建|编辑|风格|融合|诊断|重试|状态|帮助>；/生图 帮助 查看示例。")
+            yield event.plain_result(f"参数错误：{exc}\n用法：/生图 <创建|编辑|风格|融合|诊断|重试|状态|补发|帮助>；/生图 帮助 查看示例。")
             return
         if request.action == "help":
             yield event.plain_result(HELP)
             return
+        if request.action == "resend":
+            yield event.plain_result(await self._resend_output(event, request.prompt))
+            return
         if request.action == "status":
+            if request.prompt:
+                yield event.plain_result(self._receipt_status(event, request.prompt))
+                return
             async for result in self.cmd_status(event):
                 yield result
             return
@@ -522,6 +586,46 @@ class GptImageStudio(Star):
             self._submit_image(event, last.prompt, replay=last)
         except ClientError as exc:
             yield event.plain_result(str(exc))
+
+    def _receipt(self, event, job):
+        if self.receipts is None or not JOB_ID.fullmatch(job):
+            return None
+        scope = self._receipt_scope(event)
+        return self.receipts.get(job.lower(), scope) if scope else None
+
+    def _receipt_status(self, event, job):
+        row = self._receipt(event, job)
+        if row is None:
+            return "未找到该任务；请由原发起人在原会话查询，记录最多保留 24 小时。"
+        note = f"任务 {job}：{row['status']}。"
+        if row["output"]:
+            if self.store and recover_output(self.store.dir, row["output"]):
+                note += f"没收到图？发 /生图 补发 {job} 取回，不重新生成。"
+            else:
+                note += "成品文件已清理或不可用。"
+        return note
+
+    async def _resend_output(self, event, job):
+        row = self._receipt(event, job)
+        if row is None:
+            return "未找到可补发任务；只允许原发起人在原会话操作。"
+        if not row["final"] or job in self._jobs or job in self._resending:
+            return "任务仍在处理或发图中，请稍候再试。"
+        path = recover_output(self.store.dir, row["output"]) if self.store else None
+        if path is None:
+            return "任务没有可取回的成品，或图片已被清理；未重新生成。"
+        task = asyncio.current_task()
+        self._active_tasks.add(task)
+        self._resending.add(job)
+        try:
+            await self._deliver_chain(event, build_reply(path, f"任务 {job} · 原图补发"))
+        except Exception:
+            logger.warning("GPT 生图大师补发结果不明：job=%s", job)
+            return "补发结果不明，请先确认群里是否收到；未重新生成，也未自动重发。"
+        finally:
+            self._resending.discard(job)
+            self._active_tasks.discard(task)
+        return "已提交原图补发，未调用生图模型或扣除生图额度。"
 
     @filter.command("生图状态", priority=sys.maxsize)
     async def cmd_status(self, event: AstrMessageEvent):

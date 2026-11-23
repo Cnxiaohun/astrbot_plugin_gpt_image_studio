@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager, suppress
+from typing import Any, AsyncIterator, Callable
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -28,9 +28,8 @@ class AmbiguousRequestError(ClientError):
 
 
 class HTTPRequestError(ClientError):
-    def __init__(self, status: int, retryable: bool = False):
+    def __init__(self, status: int):
         self.status = status
-        self.retryable = retryable
         super().__init__(f"API HTTP {status}")
 
 
@@ -113,13 +112,9 @@ def strict_json_loads(text: str | bytes) -> Any:
     return json.loads(text, object_pairs_hook=_no_duplicate_pairs, parse_constant=_invalid_constant)
 
 
-def _retry_delay(response: httpx.Response | None, attempt: int) -> float:
-    if response is not None:
-        try:
-            return max(0.0, min(float(response.headers.get("retry-after", "")), 30.0))
-        except ValueError:
-            pass
-    return min(float(2**attempt), 8.0)
+def uncertain_result(detail: str) -> AmbiguousRequestError:
+    """Use only locally constructed, safe detail strings."""
+    return AmbiguousRequestError(f"{detail}；任务可能已计费，未自动重试或切换模型，请先核实")
 
 
 async def _send(
@@ -130,43 +125,41 @@ async def _send(
     max_bytes: int,
     attempts: int,
 ) -> dict[str, Any]:
-    """Shared engine for JSON and multipart. Retries only 429/5xx/pre-connect."""
+    """Retry only proven pre-send connection failures, never a received status.
+
+    A gateway status (even 429) doesn't prove the upstream didn't accept a POST.
+    """
     for attempt in range(attempts):
-        response: httpx.Response | None = None
+        request = request_factory()
+        request.extensions = {"timeout": httpx.Timeout(timeout).as_dict()}
         try:
-            request = request_factory()
-            request.extensions = {"timeout": httpx.Timeout(timeout).as_dict()}
             response = await client.send(request, auth=None, follow_redirects=False, stream=True)
-            if response.status_code >= 300:
-                retryable = response.status_code == 429 or response.status_code >= 500
-                if retryable and attempt + 1 < attempts:
-                    delay = _retry_delay(response, attempt)
-                    await response.aclose()
-                    await asyncio.sleep(delay)
-                    continue
-                raise HTTPRequestError(response.status_code, retryable)
-            raw = await read_bounded(response, max_bytes)
-            try:
-                value = strict_json_loads(raw)
-            except (ValueError, UnicodeError, RecursionError):
-                raise ClientError("API 返回的 JSON 不合法") from None
-            if not isinstance(value, dict):
-                raise ClientError("API JSON 响应不是对象")
-            return value
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
             if attempt + 1 >= attempts:
-                raise ConnectionFailure("API 连接失败（未取得响应）") from None
-            await asyncio.sleep(_retry_delay(None, attempt))
-        except (httpx.ReadTimeout, httpx.ReadError, httpx.WriteTimeout, httpx.WriteError, httpx.RemoteProtocolError):
-            raise AmbiguousRequestError(
-                "API 响应中断或读写超时，任务可能已提交计费；已停止自动重试，请人工确认"
-            ) from None
+                raise ConnectionFailure("API 连接建立失败，未发送生图请求") from None
+            await asyncio.sleep(2 ** min(attempt, 3))
+            continue
         except httpx.HTTPError:
-            raise ClientError("API 网络请求失败") from None
+            raise uncertain_result("生图 API 请求中断或读写超时") from None
+        try:
+            status = response.status_code
+            if status == 408 or status >= 500:
+                raise uncertain_result(f"生图 API HTTP {status}，上游处理结果不明")
+            if not 200 <= status < 300:
+                raise HTTPRequestError(status)
+            try:
+                raw = await read_bounded(response, max_bytes)
+                value = strict_json_loads(raw)
+            except (ClientError, httpx.HTTPError, ValueError, RecursionError):
+                raise uncertain_result("生图 API 成功响应无法完整读取或不是有效 JSON") from None
+            if not isinstance(value, dict):
+                raise uncertain_result("生图 API 成功响应不是 JSON 对象")
+            return value
         finally:
-            if response is not None:
+            # An expected transport cleanup error must not mask the outcome.
+            with suppress(httpx.HTTPError):
                 await response.aclose()
-    raise ConnectionFailure("API 连接失败")
+    raise ConnectionFailure("API 连接建立失败，未发送生图请求")
 
 
 def _auth_headers(key: str, content_type: str) -> dict[str, str]:

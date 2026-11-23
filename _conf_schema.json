@@ -21,7 +21,7 @@
         "default": "gpt-image-2"
       },
       "fallback_models": {
-        "description": "备用生图模型（主模型失败时按顺序尝试）",
+        "description": "备用生图模型（仅确认请求未发送的连接失败时按顺序尝试）",
         "type": "list",
         "default": []
       },

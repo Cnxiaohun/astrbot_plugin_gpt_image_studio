@@ -30,6 +30,7 @@ from .http_utils import (
     positive_int,
     post_json,
     post_multipart,
+    uncertain_result,
     use_client,
 )
 from .images import ImageError, inspect_image
@@ -72,6 +73,15 @@ def _first_entry(response: dict[str, Any]) -> dict[str, Any]:
     return entries[0]
 
 
+def _status_error(status: int) -> ClientError:
+    if status in {401, 403}:
+        return ImageError(f"API HTTP {status}：认证/权限失败，请检查 Key；未自动重试或切换模型")
+    if status == 429:
+        # A gateway can report throttling after dispatching upstream.
+        return uncertain_result("生图 API HTTP 429（限流），无法确认上游是否接收任务")
+    return ImageError(f"生图 API HTTP {status}；未自动重试或切换模型")
+
+
 class ImageClient:
     def __init__(self, api: dict, client: httpx.AsyncClient | None = None):
         self.api = api
@@ -100,14 +110,21 @@ class ImageClient:
         return positive_int(override if override else self.api.get("timeout_seconds", 300), 300, 1800)
 
     async def _finish(self, response: dict[str, Any], model: str) -> ImageResult:
-        entry = _first_entry(response)
-        if entry.get("b64_json") is not None:
-            data = _decode_base64(entry["b64_json"])
-        elif isinstance(entry.get("url"), str) and entry["url"].startswith(("http://", "https://")):
-            data = await self._download(entry["url"])
-        else:
-            raise ImageError("生图 API 缺少 b64_json/url")
-        mime, width, height = await asyncio.to_thread(inspect_image, data)
+        try:
+            if response.get("error") is not None:
+                raise ImageError("生图 API 成功响应包含错误字段")
+            entry = _first_entry(response)
+            if entry.get("b64_json") is not None:
+                data = _decode_base64(entry["b64_json"])
+            elif isinstance(entry.get("url"), str) and entry["url"].startswith(("http://", "https://")):
+                data = await self._download(entry["url"])
+            else:
+                raise ImageError("生图 API 缺少 b64_json/url")
+            mime, width, height = await asyncio.to_thread(inspect_image, data)
+        except ImageError as exc:
+            raise uncertain_result(str(exc)) from None
+        except (httpx.InvalidURL, ValueError):
+            raise uncertain_result("生图 API 返回的图片结果无效") from None
         usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
         actual = response.get("model") if isinstance(response.get("model"), str) else model
         revised = entry.get("revised_prompt") if isinstance(entry.get("revised_prompt"), str) else ""
@@ -159,10 +176,7 @@ class ImageClient:
                 except AmbiguousRequestError:
                     raise
                 except HTTPRequestError as exc:
-                    if exc.status in {401, 403}:
-                        raise ImageError(f"API HTTP {exc.status}：认证/权限失败，请检查 Key") from None
-                    last = exc
-                    continue
+                    raise _status_error(exc.status) from None
                 except ConnectionFailure as exc:
                     last = exc
                     continue
@@ -216,10 +230,7 @@ class ImageClient:
                 except AmbiguousRequestError:
                     raise
                 except HTTPRequestError as exc:
-                    if exc.status in {401, 403}:
-                        raise ImageError(f"API HTTP {exc.status}：认证/权限失败，请检查 Key") from None
-                    last = exc
-                    continue
+                    raise _status_error(exc.status) from None
                 except ConnectionFailure as exc:
                     last = exc
                     continue
